@@ -34,3 +34,7 @@ vendor/
 .trigger-debug
 .trigger
 valence/
+
+# local mTLS certs
+certs/
+velocity/

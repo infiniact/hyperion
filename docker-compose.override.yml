@@ -1,0 +1,55 @@
+# Local dev override.
+#  1. Injects the mTLS certs that the mTLS commit made mandatory (./certs, git-ignored).
+#  2. Fronts the stack with Velocity + ViaVersion so ANY client version can connect.
+#
+# Topology:  client (any version) -> velocity:25565 (+ViaVersion) -> hyperion-proxy -> bedwars (mTLS)
+# Not for production use.
+services:
+  # Public entrypoint. Translates newer clients down to Hyperion's 1.20.1 (protocol 763).
+  velocity:
+    image: itzg/mc-proxy
+    ports:
+      - "25565:25565"
+    environment:
+      TYPE: VELOCITY
+      VELOCITY_VERSION: latest
+      # Drives which ViaVersion build is pulled from Modrinth. Set to the CLIENT version
+      # you connect with; ViaVersion translates it down to Hyperion's 1.20.1 backend.
+      MINECRAFT_VERSION: 26.1.2
+      MEMORY: 512m
+      # Auto-install ViaVersion (newer->older) + ViaBackwards (older->newer) from Modrinth.
+      MODRINTH_PROJECTS: |
+        viaversion
+        viabackwards
+      MODRINTH_LOADER: velocity
+      MODRINTH_DOWNLOAD_DEPENDENCIES: required
+    volumes:
+      - ./velocity:/server
+    networks:
+      - proxy-network
+    depends_on:
+      - hyperion-proxy
+
+  # Now internal-only: Velocity is the public face, so drop the host 25565 binding.
+  hyperion-proxy:
+    ports: !reset []
+    expose:
+      - "25565"
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      - HYPERION_PROXY_ROOT_CA_CERT=/certs/root_ca.crt
+      - HYPERION_PROXY_CERT=/certs/proxy.crt
+      - HYPERION_PROXY_PRIVATE_KEY=/certs/proxy_key.pem
+
+  bedwars:
+    volumes:
+      - ./certs:/certs:ro
+      # bedwars embeds a proxy module that loads these from its CWD (/)
+      - ./certs/root_ca.crt:/root_ca.crt:ro
+      - ./certs/proxy.crt:/proxy.crt:ro
+      - ./certs/proxy_key.pem:/proxy_private_key.pem:ro
+    environment:
+      - BEDWARS_ROOT_CA_CERT=/certs/root_ca.crt
+      - BEDWARS_CERT=/certs/bedwars.crt
+      - BEDWARS_PRIVATE_KEY=/certs/bedwars_key.pem
