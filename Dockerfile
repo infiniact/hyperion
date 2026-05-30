@@ -86,11 +86,11 @@ RUN --mount=type=cache,target=${CARGO_HOME}/registry \
     cp target/release-full/rust-mc-bot /app/build/
 
 # ---- AI agent sidecar ----
-# Built with a SEPARATE stable toolchain from sibling sources (iacoder +
-# hyperion-ai-agent), passed in as BuildKit additional build contexts. Kept
-# apart from the bedwars build because bedwars pins an old nightly that cannot
-# compile iacoder's dependency tree (rig-core et al.). Produces a Linux binary
-# that the bedwars container spawns as the `/ai` agent.
+# The agent crate (crates/hyperion-ai-agent) ships in THIS repo but is excluded
+# from the workspace; it builds with a SEPARATE stable toolchain because bedwars
+# pins an old nightly that cannot compile iacoder's dependency tree (rig-core
+# et al.). iacoder is an external sibling repo, passed in as a BuildKit
+# additional build context. Produces a Linux binary that bedwars spawns for /ai.
 FROM packages AS sidecar-build
 ARG CARGO_HOME=/usr/local/cargo
 ENV CARGO_HOME=${CARGO_HOME}
@@ -98,16 +98,19 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && \
     $CARGO_HOME/bin/rustc --version
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
-# Sibling layout on disk so hyperion-ai-agent's `../iacoder` path deps resolve.
+# Reproduce the on-disk relative layout (the crate's path dep is
+# ../../../iacoder): agent under /build/hyperion/crates/hyperion-ai-agent,
+# iacoder at /build/iacoder. The agent source comes from the main build
+# context (it's in this repo); iacoder from the `iacoder` additional context.
 # Copy source subdirs only — never the multi-GB target/ dirs.
 COPY --from=iacoder Cargo.toml Cargo.lock rust-toolchain.toml /build/iacoder/
 COPY --from=iacoder crates /build/iacoder/crates
-COPY --from=agent Cargo.toml Cargo.lock rust-toolchain.toml /build/hyperion-ai-agent/
-COPY --from=agent src /build/hyperion-ai-agent/src
-WORKDIR /build/hyperion-ai-agent
+COPY crates/hyperion-ai-agent/Cargo.toml crates/hyperion-ai-agent/Cargo.lock crates/hyperion-ai-agent/rust-toolchain.toml /build/hyperion/crates/hyperion-ai-agent/
+COPY crates/hyperion-ai-agent/src /build/hyperion/crates/hyperion-ai-agent/src
+WORKDIR /build/hyperion/crates/hyperion-ai-agent
 RUN --mount=type=cache,target=${CARGO_HOME}/registry \
     --mount=type=cache,target=${CARGO_HOME}/git \
-    --mount=type=cache,target=/build/hyperion-ai-agent/target \
+    --mount=type=cache,target=/build/hyperion/crates/hyperion-ai-agent/target \
     cargo build --release && \
     mkdir -p /out && cp target/release/hyperion-ai-agent /out/
 
@@ -133,10 +136,10 @@ ENTRYPOINT ["/hyperion-proxy"]
 
 FROM runtime-base AS bedwars
 COPY --from=build-release /app/build/bedwars /
-# AI agent sidecar, spawned by bedwars for the `/ai` command, plus its config
-# (keys stay in env via ${ENV:...}; not baked here).
+# AI agent sidecar, spawned by bedwars for the `/ai` command, plus its default
+# config (keys via ${ENV:...}; overridable by mounting a preset over /config.toml).
 COPY --from=sidecar-build /out/hyperion-ai-agent /hyperion-ai-agent
-COPY --from=agent config.toml /config.toml
+COPY crates/hyperion-ai-agent/config.toml /config.toml
 LABEL org.opencontainers.image.source="https://github.com/andrewgazelka/hyperion" \
     org.opencontainers.image.description="Hyperion Bedwars Event" \
     org.opencontainers.image.version="0.1.0"

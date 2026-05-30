@@ -44,11 +44,11 @@ services:
 
   bedwars:
     build:
-      # Sibling sources for the AI agent sidecar, baked into the image by the
-      # `sidecar-build` stage. Built with their own stable toolchain.
+      # iacoder source for the AI agent sidecar's `sidecar-build` stage. The
+      # agent crate itself now lives in this repo (crates/hyperion-ai-agent),
+      # so only iacoder needs to come in as an external context.
       additional_contexts:
         iacoder: ../iacoder
-        agent: ../hyperion-ai-agent
     volumes:
       - ./certs:/certs:ro
       # bedwars embeds a proxy module that loads these from its CWD (/)
@@ -75,3 +75,19 @@ services:
       # to a config alias ("claude") or "<provider>/<model>"
       # ("anthropic/claude-sonnet-4-5"), e.g.:
       #   - HYPERION_AI_MODEL=anthropic/claude-sonnet-4-5
+      # The host reaches the LLM APIs through a local proxy (Clash/mihomo on
+      # *:7897). The container resolves those domains to fake-IPs and can't
+      # tunnel itself, so route the sidecar's HTTPS (reqwest) through the host
+      # proxy. Internal/loopback traffic bypasses it via NO_PROXY.
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      - ALL_PROXY=http://host.docker.internal:7897
+      - http_proxy=http://host.docker.internal:7897
+      - https_proxy=http://host.docker.internal:7897
+      - all_proxy=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1,hyperion-proxy,bedwars,velocity,.local
+      - no_proxy=localhost,127.0.0.1,hyperion-proxy,bedwars,velocity,.local
+      # Verbose AI logging so /ai model requests/responses show up in the logs.
+      # reqwest=debug surfaces the outbound HTTP call to the LLM (URL, proxy use,
+      # status); hyper=info keeps the byte-level noise down.
+      - RUST_LOG=info,hyperion_ai_agent=debug,iacoder_agent=debug,iacoder_core=debug,iacoder_tools=debug,reqwest=debug,rig=debug,rig_core=debug,hyper=info

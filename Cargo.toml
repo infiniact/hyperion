@@ -43,6 +43,12 @@ members = [
     'tools/packet-inspector',
     'tools/rust-mc-bot',
 ]
+# The AI agent sidecar (crates/hyperion-ai-agent) is an internal tool but NOT a
+# workspace member: it depends on iacoder, which needs a stable toolchain, while
+# this workspace pins an old nightly. It builds standalone (`cargo build` inside
+# the crate, using its own rust-toolchain.toml). Excluded so workspace commands
+# (and CI's `cargo build --workspace`) ignore it.
+exclude = ['crates/hyperion-ai-agent']
 resolver = '2'
 
 [workspace.dependencies]

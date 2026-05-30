@@ -1,0 +1,28 @@
+# AI agent config for the in-game `/ai` assistant (iacoder Config format).
+#
+# Baked into the bedwars image at /config.toml and loaded directly by the
+# sidecar (HYPERION_AI_CONFIG overrides the path). It selects the provider and
+# model; the model can also be overridden at runtime with HYPERION_AI_MODEL.
+#
+# SECRETS: api_key uses ${ENV:VAR} so keys stay in the environment and are
+# NEVER baked into the image. Set the referenced env var on the bedwars
+# service (docker-compose.override.yml passes ANTHROPIC_API_KEY through).
+
+default_model = "claude"
+
+[providers.anthropic]
+api_key = "${ENV:ANTHROPIC_API_KEY}"
+
+[models.claude]
+provider = "anthropic"
+model    = "claude-sonnet-4-5"
+
+# --- Example: use a GLM / Z.AI setup instead (matches iacoder's own config) ---
+# default_model = "glm-coding"
+#
+# [providers.zhipu_coding]
+# api_key = "${ENV:ZHIPU_API_KEY}"
+#
+# [models.glm-coding]
+# provider = "zhipu_coding"
+# model    = "glm-5.1"

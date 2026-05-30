@@ -1,0 +1,25 @@
+[package]
+name = "hyperion-ai-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Out-of-process AI agent sidecar for the Hyperion Minecraft server. Drives an iacoder agent whose tools act on the game by emitting JSON actions on stdout."
+
+[dependencies]
+# iacoder lives in a sibling repo of hyperion (../../../iacoder relative to this
+# crate). Consumed by path and built with THIS crate's own toolchain (stable) —
+# this crate is EXCLUDED from the hyperion workspace because hyperion pins an old
+# nightly that can't compile iacoder's tree. See the workspace `exclude` entry.
+iacoder-core = { path = "../../../iacoder/crates/iacoder-core" }
+iacoder-agent = { path = "../../../iacoder/crates/iacoder-agent" }
+
+anyhow = "1"
+async-trait = "0.1"
+camino = "1"
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
