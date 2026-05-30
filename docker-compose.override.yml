@@ -49,7 +49,10 @@ services:
       - ./certs/root_ca.crt:/root_ca.crt:ro
       - ./certs/proxy.crt:/proxy.crt:ro
       - ./certs/proxy_key.pem:/proxy_private_key.pem:ro
+      # custom local world (must contain region/); overrides the downloaded GenMap
+      - ./map:/map:ro
     environment:
       - BEDWARS_ROOT_CA_CERT=/certs/root_ca.crt
       - BEDWARS_CERT=/certs/bedwars.crt
       - BEDWARS_PRIVATE_KEY=/certs/bedwars_key.pem
+      - HYPERION_MAP_DIR=/map

@@ -38,3 +38,5 @@ valence/
 # local mTLS certs
 certs/
 velocity/
+# custom local world
+map/
