@@ -43,6 +43,12 @@ services:
       - HYPERION_PROXY_PRIVATE_KEY=/certs/proxy_key.pem
 
   bedwars:
+    build:
+      # Sibling sources for the AI agent sidecar, baked into the image by the
+      # `sidecar-build` stage. Built with their own stable toolchain.
+      additional_contexts:
+        iacoder: ../iacoder
+        agent: ../hyperion-ai-agent
     volumes:
       - ./certs:/certs:ro
       # bedwars embeds a proxy module that loads these from its CWD (/)
@@ -51,8 +57,21 @@ services:
       - ./certs/proxy_key.pem:/proxy_private_key.pem:ro
       # custom local world (must contain region/); overrides the downloaded GenMap
       - ./map:/map:ro
+      # Use the preset iacoder config (GLM/Z.AI providers + keys) for the AI
+      # agent, overriding the stub baked into the image. Keys stay on the host,
+      # not in the image. The sidecar reads /config.toml (HYPERION_AI_CONFIG).
+      - ../iacoder/.iacoder/config.toml:/config.toml:ro
     environment:
       - BEDWARS_ROOT_CA_CERT=/certs/root_ca.crt
       - BEDWARS_CERT=/certs/bedwars.crt
       - BEDWARS_PRIVATE_KEY=/certs/bedwars_key.pem
       - HYPERION_MAP_DIR=/map
+      # The AI agent sidecar reads this. Set it in your shell (or .env) before
+      # `docker compose up`. Without it the sidecar exits and /ai stays off.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # NOTE: model selection comes from /config.toml's `default_model` (alias
+      # "claude"). Do NOT set HYPERION_AI_MODEL to a bare model id like
+      # "claude-sonnet-4-5" — that's not a valid selection. To override, set it
+      # to a config alias ("claude") or "<provider>/<model>"
+      # ("anthropic/claude-sonnet-4-5"), e.g.:
+      #   - HYPERION_AI_MODEL=anthropic/claude-sonnet-4-5

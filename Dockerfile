@@ -85,6 +85,32 @@ RUN --mount=type=cache,target=${CARGO_HOME}/registry \
     cp target/release-full/bedwars /app/build/ && \
     cp target/release-full/rust-mc-bot /app/build/
 
+# ---- AI agent sidecar ----
+# Built with a SEPARATE stable toolchain from sibling sources (iacoder +
+# hyperion-ai-agent), passed in as BuildKit additional build contexts. Kept
+# apart from the bedwars build because bedwars pins an old nightly that cannot
+# compile iacoder's dependency tree (rig-core et al.). Produces a Linux binary
+# that the bedwars container spawns as the `/ai` agent.
+FROM packages AS sidecar-build
+ARG CARGO_HOME=/usr/local/cargo
+ENV CARGO_HOME=${CARGO_HOME}
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && \
+    $CARGO_HOME/bin/rustc --version
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+# Sibling layout on disk so hyperion-ai-agent's `../iacoder` path deps resolve.
+# Copy source subdirs only — never the multi-GB target/ dirs.
+COPY --from=iacoder Cargo.toml Cargo.lock rust-toolchain.toml /build/iacoder/
+COPY --from=iacoder crates /build/iacoder/crates
+COPY --from=agent Cargo.toml Cargo.lock rust-toolchain.toml /build/hyperion-ai-agent/
+COPY --from=agent src /build/hyperion-ai-agent/src
+WORKDIR /build/hyperion-ai-agent
+RUN --mount=type=cache,target=${CARGO_HOME}/registry \
+    --mount=type=cache,target=${CARGO_HOME}/git \
+    --mount=type=cache,target=/build/hyperion-ai-agent/target \
+    cargo build --release && \
+    mkdir -p /out && cp target/release/hyperion-ai-agent /out/
+
 # Runtime base image
 FROM ubuntu:24.04 AS runtime-base
 RUN apt-get update && \
@@ -107,11 +133,17 @@ ENTRYPOINT ["/hyperion-proxy"]
 
 FROM runtime-base AS bedwars
 COPY --from=build-release /app/build/bedwars /
+# AI agent sidecar, spawned by bedwars for the `/ai` command, plus its config
+# (keys stay in env via ${ENV:...}; not baked here).
+COPY --from=sidecar-build /out/hyperion-ai-agent /hyperion-ai-agent
+COPY --from=agent config.toml /config.toml
 LABEL org.opencontainers.image.source="https://github.com/andrewgazelka/hyperion" \
     org.opencontainers.image.description="Hyperion Bedwars Event" \
     org.opencontainers.image.version="0.1.0"
 ENV BEDWARS_IP="0.0.0.0" \
-    BEDWARS_PORT="35565"
+    BEDWARS_PORT="35565" \
+    BEDWARS_AI_AGENT_BIN="/hyperion-ai-agent" \
+    HYPERION_AI_CONFIG="/config.toml"
 EXPOSE 35565
 ENTRYPOINT ["/bedwars"]
 

@@ -13,12 +13,13 @@ use valence_text::IntoText;
 use crate::{
     plugin::{
         attack::AttackPlugin, block::BlockPlugin, bow::BowPlugin, chat::ChatPlugin,
-        damage::DamagePlugin, regeneration::RegenerationPlugin, spawn::SpawnPlugin,
-        stats::StatsPlugin, vanish::VanishPlugin,
+        damage::DamagePlugin, lotus::LotusPlugin, regeneration::RegenerationPlugin,
+        spawn::SpawnPlugin, stats::StatsPlugin, vanish::VanishPlugin,
     },
     skin::SkinPlugin,
 };
 
+mod ai;
 mod command;
 mod plugin;
 mod skin;
@@ -119,6 +120,7 @@ impl Plugin for BedwarsPlugin {
                 BowPlugin,
                 ChatPlugin,
                 DamagePlugin,
+                LotusPlugin,
                 RegenerationPlugin,
                 SkinPlugin,
                 SpawnPlugin,
@@ -126,6 +128,7 @@ impl Plugin for BedwarsPlugin {
                 VanishPlugin,
             ),
             hyperion_clap::ClapCommandPlugin,
+            ai::AiPlugin,
             hyperion_genmap::GenMapPlugin,
             hyperion_item::ItemPlugin,
             hyperion_permission::PermissionPlugin,
