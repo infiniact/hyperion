@@ -157,7 +157,7 @@ fn drain_city_net(
 
 /// Push the vanilla rain/thunder game-state to one client (per-player weather).
 fn send_precip(compose: &Compose, connection: ConnectionId, precip: Precip) {
-    let mut send = |kind, value: f32| {
+    let send = |kind, value: f32| {
         let _ok = compose.unicast(&GameStateChangeS2c { kind, value }, connection);
     };
     match precip {
