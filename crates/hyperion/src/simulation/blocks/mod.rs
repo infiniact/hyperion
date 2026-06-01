@@ -1,6 +1,12 @@
 //! Constructs for working with blocks.
 
-use std::{future::Future, ops::Try, path::Path, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    ops::Try,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use bevy::prelude::*;
@@ -34,8 +40,11 @@ mod loader;
 mod manager;
 
 pub mod frame;
+mod persist;
 mod region;
 mod shared;
+
+use persist::EditStore;
 
 pub enum GetChunk<'a> {
     Loaded(&'a Column),
@@ -75,6 +84,10 @@ pub struct Blocks {
     tx_loaded_chunks: tokio::sync::mpsc::UnboundedSender<Column>,
     rx_loaded_chunks: tokio::sync::mpsc::UnboundedReceiver<Column>,
     pub to_confirm: Vec<EntityAndSequence>,
+
+    /// Crash-safe overlay of runtime block edits on top of the read-only base
+    /// world. `None` = persistence disabled (no `HYPERION_EDITS_DIR`).
+    edits: Option<EditStore>,
 }
 
 impl From<ChunkLoaderHandle> for Blocks {
@@ -87,6 +100,7 @@ impl From<ChunkLoaderHandle> for Blocks {
             tx_loaded_chunks,
             rx_loaded_chunks,
             to_confirm: vec![],
+            edits: None,
         }
     }
 }
@@ -101,9 +115,34 @@ impl Blocks {
 
         let loader_handle = launch_loader(shared, runtime);
 
-        let result = Self::from(loader_handle);
+        let mut result = Self::from(loader_handle);
+
+        // Enable crash-safe persistence when an edits directory is configured.
+        if let Ok(dir) = std::env::var("HYPERION_EDITS_DIR") {
+            result.edits = Some(EditStore::open(PathBuf::from(dir))?);
+        }
 
         Ok(result)
+    }
+
+    /// Snapshot the edit overlay to disk if it has unsaved changes. Atomic
+    /// (temp + fsync + rename), so an interrupted save never corrupts the live
+    /// file. Cheap no-op when nothing changed or persistence is disabled.
+    pub fn save_edits(&mut self) {
+        let Some(edits) = &mut self.edits else {
+            return;
+        };
+        if !edits.is_dirty() {
+            return;
+        }
+        let dir = edits.dir().to_path_buf();
+        let buf = edits.serialize_and_clear();
+        // Small overlay written infrequently; a synchronous atomic write keeps
+        // the durability guarantee simple. (Move to a blocking task if builds
+        // ever grow large enough to hitch the tick.)
+        if let Err(e) = persist::write_atomic(&dir, &buf) {
+            error!("failed to save world edits: {e}");
+        }
     }
 
     #[must_use]
@@ -232,9 +271,31 @@ impl Blocks {
     }
 
     pub fn load_pending(&mut self) {
-        while let Ok(chunk) = self.rx_loaded_chunks.try_recv() {
-            let position = chunk.position;
-            let position = position.as_i16vec2();
+        while let Ok(mut chunk) = self.rx_loaded_chunks.try_recv() {
+            let position = chunk.position.as_i16vec2();
+
+            // Replay persisted edits onto the freshly-loaded chunk so builds
+            // survive restarts, then rebuild the client packet so players
+            // receive the edited chunk directly.
+            if let Some(edits) = self.edits.as_ref().and_then(|e| e.for_chunk(position)) {
+                if !edits.is_empty() {
+                    let start_x = i32::from(position.x) << 4;
+                    let start_z = i32::from(position.y) << 4;
+                    for (&pos, &state) in edits {
+                        let (Ok(x), Ok(y), Ok(z)) = (
+                            u32::try_from(pos.x - start_x),
+                            u32::try_from(pos.y + 64),
+                            u32::try_from(pos.z - start_z),
+                        ) else {
+                            continue;
+                        };
+                        chunk.data.set_delta(x, y, z, state);
+                    }
+                    if let Some(bytes) = loader::encode_column(&chunk.data, position) {
+                        chunk.base_packet_bytes = bytes;
+                    }
+                }
+            }
 
             self.chunk_cache.insert(position, chunk);
         }
@@ -384,11 +445,31 @@ impl Blocks {
         Some(chunk.block_state(x, y, z))
     }
 
-    /// Returns the old block state
+    /// Set a block and persist it (so it survives restarts). Returns the old
+    /// block state.
     pub fn set_block(
         &mut self,
         position: IVec3,
         state: BlockState,
+    ) -> Result<BlockState, TrySetBlockDeltaError> {
+        self.set_block_inner(position, state, true)
+    }
+
+    /// Set a block **without persisting it** — for transient/cosmetic effects
+    /// (e.g. the step-lotus) that should never end up in the saved world.
+    pub fn set_block_transient(
+        &mut self,
+        position: IVec3,
+        state: BlockState,
+    ) -> Result<BlockState, TrySetBlockDeltaError> {
+        self.set_block_inner(position, state, false)
+    }
+
+    fn set_block_inner(
+        &mut self,
+        position: IVec3,
+        state: BlockState,
+        persist: bool,
     ) -> Result<BlockState, TrySetBlockDeltaError> {
         const START_Y: i32 = -64;
 
@@ -415,6 +496,11 @@ impl Blocks {
 
         if old_state != state {
             self.should_update.insert(u32::try_from(chunk_idx).unwrap());
+            if persist {
+                if let Some(edits) = &mut self.edits {
+                    edits.record(position, state);
+                }
+            }
         }
 
         Ok(old_state)

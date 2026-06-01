@@ -40,3 +40,5 @@ certs/
 velocity/
 # custom local world
 map/
+# persisted world edits
+world/

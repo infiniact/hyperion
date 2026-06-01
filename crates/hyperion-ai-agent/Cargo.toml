@@ -12,6 +12,10 @@ description = "Out-of-process AI agent sidecar for the Hyperion Minecraft server
 # nightly that can't compile iacoder's tree. See the workspace `exclude` entry.
 iacoder-core = { path = "../../../iacoder/crates/iacoder-core" }
 iacoder-agent = { path = "../../../iacoder/crates/iacoder-agent" }
+# Reuse iacoder's built-in web tools (search + fetch) instead of writing our own,
+# so the in-game agent can research what to build. Already in the dependency
+# graph via iacoder-agent, so this adds no new compile/link footprint.
+iacoder-tools = { path = "../../../iacoder/crates/iacoder-tools" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -19,7 +23,7 @@ camino = "1"
 schemars = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

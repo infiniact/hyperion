@@ -10,6 +10,13 @@ use bevy::{
 pub use cached_save::cached_save;
 pub use prev::{Prev, track_prev};
 
+/// Fetch a URL and return the response body as text. Honors `HTTP(S)_PROXY`
+/// env vars (reqwest default), so it works behind a local proxy.
+pub async fn fetch_text(url: &str) -> anyhow::Result<String> {
+    let response = reqwest::get(url).await?.error_for_status()?;
+    Ok(response.text().await?)
+}
+
 pub trait EntityExt: Sized {
     fn id(&self) -> u32;
     fn from_id(id: u32, world: &World) -> anyhow::Result<Self>;

@@ -1,28 +1,40 @@
 # AI agent config for the in-game `/ai` assistant (iacoder Config format).
 #
 # Baked into the bedwars image at /config.toml and loaded directly by the
-# sidecar (HYPERION_AI_CONFIG overrides the path). It selects the provider and
-# model; the model can also be overridden at runtime with HYPERION_AI_MODEL.
+# sidecar (HYPERION_AI_CONFIG overrides the path). It selects providers + models;
+# the model can also be overridden at runtime with HYPERION_AI_MODEL
+# (docker-compose sets it to "deepseek-flash").
 #
-# SECRETS: api_key uses ${ENV:VAR} so keys stay in the environment and are
-# NEVER baked into the image. Set the referenced env var on the bedwars
-# service (docker-compose.override.yml passes ANTHROPIC_API_KEY through).
+# SECRETS: every api_key uses ${ENV:VAR}, so keys live ONLY in the environment —
+# never in this file, the repo, or the image. Set the referenced vars on the
+# bedwars service (docker-compose passes DEEPSEEK_API_KEY / ZHIPU_API_KEY /
+# ZAI_API_KEY through from your shell or .env).
 
-default_model = "claude"
+default_model = "deepseek-flash"
 
-[providers.anthropic]
-api_key = "${ENV:ANTHROPIC_API_KEY}"
+[default_models]
+flash = "deepseek-flash"
 
-[models.claude]
-provider = "anthropic"
-model    = "claude-sonnet-4-5"
+[providers.deepseek]
+api_key = "${ENV:DEEPSEEK_API_KEY}"
 
-# --- Example: use a GLM / Z.AI setup instead (matches iacoder's own config) ---
-# default_model = "glm-coding"
-#
-# [providers.zhipu_coding]
-# api_key = "${ENV:ZHIPU_API_KEY}"
-#
-# [models.glm-coding]
-# provider = "zhipu_coding"
-# model    = "glm-5.1"
+[providers.zhipu_coding]
+api_key = "${ENV:ZHIPU_API_KEY}"
+
+[providers.zai]
+api_key = "${ENV:ZAI_API_KEY}"
+
+# Fast text model — the in-game /ai assistant uses this by default.
+[models.deepseek-flash]
+provider = "deepseek"
+model    = "deepseek-v4-flash"
+
+# Stronger reasoning model (set HYPERION_AI_MODEL=glm-coding to use it).
+[models.glm-coding]
+provider = "zhipu_coding"
+model    = "glm-5.1"
+
+# Vision model — for the future image-recognition step (layer 2 of /ai builds).
+[models.glm-vision]
+provider = "zai"
+model    = "glm-5v-turbo"

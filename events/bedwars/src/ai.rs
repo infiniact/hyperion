@@ -55,11 +55,6 @@ const HEALTHY_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10
 /// hot-restart loop on a misconfigured sidecar.
 const MAX_RAPID_FAILURES: u32 = 5;
 
-/// Default location of the built sidecar binary. Override with the
-/// `BEDWARS_AI_AGENT_BIN` environment variable. (A global `~/.cargo/config.toml`
-/// redirects all builds to `~/.cargo/target`, so that is the dev default.)
-const DEFAULT_AGENT_BIN: &str = "/Users/xudatie/.cargo/target/debug/hyperion-ai-agent";
-
 /// A request from a player, sent over the command channel to the writer task.
 #[derive(Debug)]
 struct AiRequest {
@@ -76,6 +71,23 @@ struct AiRequest {
 enum BridgeMsg {
     Turn(AiRequest),
     Evict(ConnectionId),
+    /// A world-read answer to send back to the sidecar (in reply to a
+    /// `get_block`/`scan_region` query), routed by `request_id`.
+    QueryResult {
+        request_id: u64,
+        blocks: Vec<BlockInfo>,
+        truncated: bool,
+        error: Option<String>,
+    },
+}
+
+/// One block read back from the world, serialized to the sidecar.
+#[derive(Debug, Serialize)]
+struct BlockInfo {
+    x: i32,
+    y: i32,
+    z: i32,
+    block: String,
 }
 
 /// An action to apply to the game world, drained on the Bevy thread.
@@ -88,13 +100,24 @@ struct GameAction {
 #[derive(Debug)]
 enum ActionKind {
     Say(String),
+    Status(String),
     PlaceBlock { pos: IVec3, block: String },
     Fill { min: IVec3, max: IVec3, block: String },
+    GetBlock { request_id: u64, pos: IVec3 },
+    ScanRegion { request_id: u64, min: IVec3, max: IVec3 },
 }
 
 /// Max blocks a single `fill` may touch. Caps both abuse ("fill the world")
 /// and the per-block `BlockUpdateS2c` packet burst we send to the player.
 const MAX_FILL_VOLUME: i64 = 16_384;
+
+/// Max blocks a single `scan_region` may read. Bounds the read cost and the
+/// size of the result we send back to the sidecar.
+const MAX_SCAN_VOLUME: i64 = 16_384;
+
+/// Max non-air blocks returned from one `scan_region`, to bound the reply
+/// payload (and the agent's token cost). Beyond this the result is truncated.
+const MAX_SCAN_RESULTS: usize = 1_024;
 
 /// One line written to the sidecar's stdin. Tagged so the sidecar can tell a
 /// new turn from a session eviction.
@@ -108,6 +131,13 @@ enum OutMsg {
     },
     Evict {
         session: u64,
+    },
+    /// Reply to a world-read query, matched on the sidecar by `request_id`.
+    QueryResult {
+        request_id: u64,
+        blocks: Vec<BlockInfo>,
+        truncated: bool,
+        error: Option<String>,
     },
 }
 
@@ -126,6 +156,9 @@ enum AgentAction {
     Say {
         text: String,
     },
+    Status {
+        text: String,
+    },
     PlaceBlock {
         x: i32,
         y: i32,
@@ -140,6 +173,21 @@ enum AgentAction {
         y2: i32,
         z2: i32,
         block: String,
+    },
+    GetBlock {
+        request_id: u64,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    ScanRegion {
+        request_id: u64,
+        x1: i32,
+        y1: i32,
+        z1: i32,
+        x2: i32,
+        y2: i32,
+        z2: i32,
     },
 }
 
@@ -191,8 +239,41 @@ pub struct AiBridge {
     _runtime: Arc<tokio::runtime::Runtime>,
 }
 
+impl AiBridge {
+    /// Queue an AI turn on behalf of `connection` (e.g. triggered by talking to
+    /// an NPC instead of the `/ai` command). The reply streams back to that
+    /// player. Returns `false` if the sidecar is unavailable or busy.
+    #[must_use]
+    pub fn ask(&self, connection: ConnectionId, prompt: String, pos: Option<[f32; 3]>) -> bool {
+        let Some(cmd_tx) = &self.cmd_tx else {
+            return false;
+        };
+        cmd_tx
+            .try_send(BridgeMsg::Turn(AiRequest {
+                connection,
+                prompt,
+                pos,
+            }))
+            .is_ok()
+    }
+}
+
+/// Locate the sidecar binary. Resolution order:
+/// 1. `BEDWARS_AI_AGENT_BIN` if set (the Docker image sets this to
+///    `/hyperion-ai-agent`).
+/// 2. Dev default `$HOME/.cargo/target/debug/hyperion-ai-agent` — a global
+///    `~/.cargo/config.toml` redirects all builds to `~/.cargo/target`, so the
+///    sidecar lands here. Derived from `$HOME`, so it works on any dev machine
+///    (no hardcoded username).
+/// 3. Bare `hyperion-ai-agent`, resolved via `PATH`, as a last resort.
 fn agent_bin() -> String {
-    std::env::var("BEDWARS_AI_AGENT_BIN").unwrap_or_else(|_| DEFAULT_AGENT_BIN.to_owned())
+    if let Ok(path) = std::env::var("BEDWARS_AI_AGENT_BIN") {
+        return path;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return format!("{home}/.cargo/target/debug/hyperion-ai-agent");
+    }
+    "hyperion-ai-agent".to_owned()
 }
 
 /// Spawn the sidecar with piped stdio.
@@ -234,6 +315,17 @@ async fn write_msg(
             };
             OutMsg::Evict { session }
         }
+        BridgeMsg::QueryResult {
+            request_id,
+            blocks,
+            truncated,
+            error,
+        } => OutMsg::QueryResult {
+            request_id,
+            blocks,
+            truncated,
+            error,
+        },
     };
 
     let line = match serde_json::to_string(&out) {
@@ -387,6 +479,7 @@ async fn reader_loop(
                 };
                 let kind = match action.kind {
                     AgentAction::Say { text } => ActionKind::Say(text),
+                    AgentAction::Status { text } => ActionKind::Status(text),
                     AgentAction::PlaceBlock { x, y, z, block } => ActionKind::PlaceBlock {
                         pos: IVec3::new(x, y, z),
                         block,
@@ -403,6 +496,28 @@ async fn reader_loop(
                         min: IVec3::new(x1.min(x2), y1.min(y2), z1.min(z2)),
                         max: IVec3::new(x1.max(x2), y1.max(y2), z1.max(z2)),
                         block,
+                    },
+                    AgentAction::GetBlock {
+                        request_id,
+                        x,
+                        y,
+                        z,
+                    } => ActionKind::GetBlock {
+                        request_id,
+                        pos: IVec3::new(x, y, z),
+                    },
+                    AgentAction::ScanRegion {
+                        request_id,
+                        x1,
+                        y1,
+                        z1,
+                        x2,
+                        y2,
+                        z2,
+                    } => ActionKind::ScanRegion {
+                        request_id,
+                        min: IVec3::new(x1.min(x2), y1.min(y2), z1.min(z2)),
+                        max: IVec3::new(x1.max(x2), y1.max(y2), z1.max(z2)),
                     },
                 };
                 if actions
@@ -479,13 +594,126 @@ fn drain_ai_actions(
                     warn!("failed to deliver AI chat message: {e}");
                 }
             }
+            ActionKind::Status(text) => {
+                // Muted style: a transient "what I'm doing" beat, not speech.
+                let packet = agnostic::chat(format!("§7§o[AI] {text}§r"));
+                if let Err(e) = compose.unicast(&packet, action.connection) {
+                    warn!("failed to deliver AI status message: {e}");
+                }
+            }
             ActionKind::PlaceBlock { pos, block } => {
                 place_block(&mut blocks, &compose, action.connection, pos, &block);
             }
             ActionKind::Fill { min, max, block } => {
                 fill_region(&mut blocks, &compose, action.connection, min, max, &block);
             }
+            ActionKind::GetBlock { request_id, pos } => {
+                let (found, error) = match blocks.get_block(pos) {
+                    Some(state) => (
+                        vec![BlockInfo {
+                            x: pos.x,
+                            y: pos.y,
+                            z: pos.z,
+                            block: state.to_kind().to_str().to_owned(),
+                        }],
+                        None,
+                    ),
+                    None => (Vec::new(), Some("unloaded or out of bounds".to_owned())),
+                };
+                info!(
+                    "AI get_block ({}, {}, {}) -> {}",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    found
+                        .first()
+                        .map_or("unloaded", |b| b.block.as_str())
+                );
+                send_query_result(&bridge, request_id, found, false, error);
+            }
+            ActionKind::ScanRegion {
+                request_id,
+                min,
+                max,
+            } => {
+                let volume = i64::from(max.x - min.x + 1)
+                    * i64::from(max.y - min.y + 1)
+                    * i64::from(max.z - min.z + 1);
+                if volume > MAX_SCAN_VOLUME {
+                    send_query_result(
+                        &bridge,
+                        request_id,
+                        Vec::new(),
+                        false,
+                        Some(format!(
+                            "region too large ({volume} blocks, max {MAX_SCAN_VOLUME})"
+                        )),
+                    );
+                } else {
+                    let mut found = Vec::new();
+                    let mut truncated = false;
+                    'scan: for x in min.x..=max.x {
+                        for y in min.y..=max.y {
+                            for z in min.z..=max.z {
+                                let Some(state) = blocks.get_block(IVec3::new(x, y, z)) else {
+                                    continue; // unloaded — skip
+                                };
+                                let kind = state.to_kind();
+                                if matches!(
+                                    kind,
+                                    BlockKind::Air | BlockKind::CaveAir | BlockKind::VoidAir
+                                ) {
+                                    continue;
+                                }
+                                if found.len() >= MAX_SCAN_RESULTS {
+                                    truncated = true;
+                                    break 'scan;
+                                }
+                                found.push(BlockInfo {
+                                    x,
+                                    y,
+                                    z,
+                                    block: kind.to_str().to_owned(),
+                                });
+                            }
+                        }
+                    }
+                    info!(
+                        "AI scan_region ({}, {}, {})-({}, {}, {}) -> {} non-air block(s){}",
+                        min.x,
+                        min.y,
+                        min.z,
+                        max.x,
+                        max.y,
+                        max.z,
+                        found.len(),
+                        if truncated { " (truncated)" } else { "" }
+                    );
+                    send_query_result(&bridge, request_id, found, truncated, None);
+                }
+            }
         }
+    }
+}
+
+/// Send a world-read answer back to the sidecar (in reply to a query action).
+fn send_query_result(
+    bridge: &AiBridge,
+    request_id: u64,
+    blocks: Vec<BlockInfo>,
+    truncated: bool,
+    error: Option<String>,
+) {
+    let Some(cmd_tx) = bridge.cmd_tx.as_ref() else {
+        return;
+    };
+    if let Err(e) = cmd_tx.try_send(BridgeMsg::QueryResult {
+        request_id,
+        blocks,
+        truncated,
+        error,
+    }) {
+        warn!("failed to enqueue AI query result: {e}");
     }
 }
 
@@ -586,14 +814,12 @@ fn fill_region(
         }
     }
 
-    let tail = if skipped > 0 {
-        format!(" ({skipped} skipped — out of bounds or unloaded)")
-    } else {
-        String::new()
-    };
-    let msg = agnostic::chat(format!("§7[AI] filled {placed} × {block}{tail}"));
-    if let Err(e) = compose.unicast(&msg, connection) {
-        warn!("ai chat send failed: {e}");
+    // No per-fill chat: a build is many fills, and one line each floods the box.
+    // The agent's progress beats ("looking at the area…") and its final reply
+    // tell the player what happened; the placed blocks speak for themselves.
+    // Keep a server-side trace only.
+    if skipped > 0 {
+        tracing::debug!("AI fill {block}: placed {placed}, skipped {skipped} (out of bounds/unloaded)");
     }
 }
 

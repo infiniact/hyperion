@@ -279,7 +279,36 @@ impl Plugin for HyperionCore {
         app.insert_resource(IgnMap::default());
         // Minecraft is 20 TPS
         app.insert_resource(Time::<Fixed>::from_hz(20.0));
+
+        // Persist runtime block edits periodically (~30s at 20 TPS) and on exit.
+        app.add_systems(FixedUpdate, persist_world_edits);
+        app.add_systems(Last, persist_world_on_exit);
     }
+}
+
+/// Snapshot the world-edit overlay roughly every 30s (600 ticks @ 20 TPS).
+/// Cheap no-op when nothing changed or persistence is disabled.
+fn persist_world_edits(
+    mut blocks: ResMut<'_, crate::simulation::blocks::Blocks>,
+    mut ticks: Local<'_, u32>,
+) {
+    *ticks += 1;
+    if *ticks >= 600 {
+        *ticks = 0;
+        blocks.save_edits();
+    }
+}
+
+/// Best-effort final save when the app is shutting down cleanly.
+fn persist_world_on_exit(
+    mut events: EventReader<'_, '_, AppExit>,
+    mut blocks: ResMut<'_, crate::simulation::blocks::Blocks>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    events.clear();
+    blocks.save_edits();
 }
 
 /// A scratch buffer for intermediate operations. This will return an empty [`Vec`] when calling [`Scratch::obtain`].

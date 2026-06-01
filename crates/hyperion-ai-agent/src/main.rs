@@ -27,7 +27,9 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -39,20 +41,38 @@ use iacoder_core::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::oneshot;
 
-/// Per-turn budget: how many tool-call rounds the agent may take.
-const MAX_TURNS: usize = 8;
+/// Per-turn budget: how many tool-call rounds the agent may take. Higher than a
+/// pure-chat agent because the observe→build→verify loop (read the world, place
+/// blocks, read again, fix) legitimately needs several rounds.
+const MAX_TURNS: usize = 14;
+
+/// How long a world-read tool waits for Hyperion to answer before giving up.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
 const SYSTEM_PROMPT: &str = "You are an in-game AI assistant on a Minecraft server (the Hyperion \
 engine). A player is talking to you through chat. Keep replies short — one or two sentences — \
 because they appear in the Minecraft chat box.\n\nTools:\n- `say`: speak to the player.\n- \
 `place_block`: place ONE block at integer world coordinates (x, y, z).\n- \
 `fill`: fill a whole cuboid between two corners with one block — use this for walls, floors, \
-towers, boxes, and clearing areas (block=\"air\"). Prefer `fill` over many `place_block` calls.\n\n\
-Block names look like \"stone\", \"oak_planks\", \"glass\", \"glowstone\". The player's current \
-coordinates are given to you each turn so you can build relative to where they stand (e.g. a few \
-blocks in front of and beside them, not inside them).\n\nYour final response text is also shown \
-to the player automatically. Be helpful and concise.";
+towers, boxes, and clearing areas (block=\"air\"). Prefer `fill` over many `place_block` calls.\n- \
+`get_block`: read the block at one coordinate. Returns its name (or that it is air/unloaded).\n- \
+`scan_region`: read a whole cuboid and list its non-air blocks. Use it to SEE the terrain before \
+you build (so you don't build inside a hill or float in the air) and to CHECK your own work after \
+building, then fix mistakes.\n\nIf you are asked to build something whose shape you are unsure \
+of, you may use the web search and web fetch tools first to learn what it typically looks like — \
+its structure, proportions, and materials — then translate that into blocks.\n\nMANDATORY build \
+procedure — follow it EVERY time, even for \
+simple builds:\n1. BEFORE placing any block, you MUST call `scan_region` over the build area to \
+see the ground and surroundings. Never build blind: do NOT call `place_block` or `fill` until \
+you have scanned.\n2. Build relative to what the scan showed — sit the structure on the ground, \
+not inside a hill or floating in the air.\n3. AFTER building, call `scan_region` again on the \
+same area to verify it looks right, and fix any mistakes before you finish.\n\nBlock names look like \
+\"stone\", \"oak_planks\", \"glass\", \"glowstone\". The player's current coordinates are given to \
+you each turn so you can build relative to where they stand (e.g. a few blocks in front of and \
+beside them, not inside them).\n\nYour final response text is also shown to the player \
+automatically. Be helpful and concise.";
 
 /// Per-session conversation history, keyed by Hyperion's session id. Stored as
 /// iacoder's transcript so the next turn can continue it via `prior_history`.
@@ -74,7 +94,40 @@ enum InMsg {
     Evict {
         session: u64,
     },
+    /// Hyperion's answer to a `get_block`/`scan_region` query, routed back to
+    /// the awaiting tool call by `request_id`.
+    QueryResult {
+        request_id: u64,
+        #[serde(default)]
+        blocks: Vec<BlockInfo>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
+
+/// One block read back from the world, used by the read tools.
+#[derive(Debug, Clone, Deserialize)]
+struct BlockInfo {
+    x: i32,
+    y: i32,
+    z: i32,
+    block: String,
+}
+
+/// Hyperion's reply to a world-read query (carried inside [`InMsg::QueryResult`]).
+#[derive(Debug)]
+struct QueryResult {
+    blocks: Vec<BlockInfo>,
+    truncated: bool,
+    error: Option<String>,
+}
+
+/// World-read queries awaiting Hyperion's reply, keyed by `request_id`. A tool
+/// call inserts a oneshot here, emits the query, then awaits the receiver; the
+/// stdin loop completes it when `QueryResult` arrives.
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<QueryResult>>>>;
 
 /// Internal carrier for one turn's data (built from [`InMsg::Turn`]).
 #[derive(Debug)]
@@ -91,6 +144,11 @@ enum ActionKind {
     Say {
         text: String,
     },
+    /// A transient progress line shown to the player in a muted style — not the
+    /// agent "speaking", just a "what I'm doing now" beat (searching, scanning).
+    Status {
+        text: String,
+    },
     PlaceBlock {
         x: i32,
         y: i32,
@@ -105,6 +163,24 @@ enum ActionKind {
         y2: i32,
         z2: i32,
         block: String,
+    },
+    /// Read one block. Hyperion replies with an `InMsg::QueryResult` tagged
+    /// with the same `request_id`.
+    GetBlock {
+        request_id: u64,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    /// Read a whole cuboid; Hyperion replies with its non-air blocks.
+    ScanRegion {
+        request_id: u64,
+        x1: i32,
+        y1: i32,
+        z1: i32,
+        x2: i32,
+        y2: i32,
+        z2: i32,
     },
 }
 
@@ -127,6 +203,39 @@ fn emit(session: u64, kind: ActionKind) {
             let _ = lock.flush();
         }
         Err(e) => tracing::error!("failed to serialize action: {e}"),
+    }
+}
+
+/// Emit a transient progress line to the player (muted style on the Hyperion
+/// side). Used by tool wrappers so the player sees the agent searching/scanning
+/// instead of staring at a silent chat box during multi-second work.
+fn emit_status(session: u64, text: impl Into<String>) {
+    emit(session, ActionKind::Status { text: text.into() });
+}
+
+/// Wraps another tool so a short status beat is shown to the player the moment
+/// the agent invokes it (e.g. "🔍 Searching the web…"), then delegates. Used to
+/// announce iacoder's own web tools, which Hyperion can't otherwise observe.
+#[derive(Debug)]
+struct Announce {
+    inner: iacoder_core::BoxedTool,
+    session: u64,
+    status: String,
+}
+
+#[async_trait]
+impl Tool for Announce {
+    fn definition(&self) -> ToolDefinition {
+        self.inner.definition()
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        emit_status(self.session, self.status.clone());
+        self.inner.call(args, ctx).await
     }
 }
 
@@ -302,11 +411,200 @@ impl Tool for FillTool {
     }
 }
 
+/// Emit a world-read query and await Hyperion's reply (or time out). Shared by
+/// the `get_block` and `scan_region` tools.
+async fn run_query(
+    pending: &Pending,
+    next_id: &AtomicU64,
+    session: u64,
+    make: impl FnOnce(u64) -> ActionKind,
+) -> Result<QueryResult, String> {
+    let request_id = next_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = oneshot::channel();
+    match pending.lock() {
+        Ok(mut map) => {
+            map.insert(request_id, tx);
+        }
+        Err(e) => return Err(format!("pending map poisoned: {e}")),
+    }
+    emit(session, make(request_id));
+    match tokio::time::timeout(QUERY_TIMEOUT, rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err("world read failed (reply channel closed)".to_owned()),
+        Err(_) => {
+            // Don't leak the pending entry on timeout.
+            if let Ok(mut map) = pending.lock() {
+                map.remove(&request_id);
+            }
+            Err("world read timed out (server busy, or persistence disabled?)".to_owned())
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetBlockInput {
+    /// Integer world X coordinate.
+    x: i32,
+    /// Integer world Y coordinate.
+    y: i32,
+    /// Integer world Z coordinate.
+    z: i32,
+}
+
+/// Read the block at one world coordinate (round-trips to Hyperion).
+#[derive(Debug)]
+struct GetBlockTool {
+    session: u64,
+    pending: Pending,
+    next_id: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl Tool for GetBlockTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "get_block".into(),
+            description: "Read the block at integer world coordinates (x, y, z). Returns the \
+                          block name, or that the position is air or unloaded. Use it to look \
+                          before you build."
+                .into(),
+            input_schema: schema_for!(GetBlockInput),
+            annotations: ToolAnnotations {
+                readonly: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let input: GetBlockInput = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArgs(format!("get_block: {e}")))?;
+        let (x, y, z) = (input.x, input.y, input.z);
+        let text = match run_query(&self.pending, &self.next_id, self.session, |request_id| {
+            ActionKind::GetBlock { request_id, x, y, z }
+        })
+        .await
+        {
+            Ok(result) => match result.error {
+                Some(err) => format!("({x}, {y}, {z}): {err}"),
+                None => match result.blocks.first() {
+                    Some(b) => format!("Block at ({x}, {y}, {z}) is `{}`.", b.block),
+                    None => format!("Block at ({x}, {y}, {z}) is air."),
+                },
+            },
+            Err(err) => err,
+        };
+        Ok(ToolOutput::text(text))
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ScanRegionInput {
+    /// First corner X.
+    x1: i32,
+    /// First corner Y.
+    y1: i32,
+    /// First corner Z.
+    z1: i32,
+    /// Opposite corner X.
+    x2: i32,
+    /// Opposite corner Y.
+    y2: i32,
+    /// Opposite corner Z.
+    z2: i32,
+}
+
+/// Read a whole cuboid and list its non-air blocks (round-trips to Hyperion).
+#[derive(Debug)]
+struct ScanRegionTool {
+    session: u64,
+    pending: Pending,
+    next_id: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl Tool for ScanRegionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "scan_region".into(),
+            description: "Read the cuboid between two corners (x1,y1,z1)-(x2,y2,z2), inclusive, \
+                          and list its non-air blocks (air is omitted). Use it to understand the \
+                          terrain before building and to verify your build afterwards. The server \
+                          caps very large regions."
+                .into(),
+            input_schema: schema_for!(ScanRegionInput),
+            annotations: ToolAnnotations {
+                readonly: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let i: ScanRegionInput = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArgs(format!("scan_region: {e}")))?;
+        emit_status(self.session, "👀 Looking at the area…");
+        let text = match run_query(&self.pending, &self.next_id, self.session, |request_id| {
+            ActionKind::ScanRegion {
+                request_id,
+                x1: i.x1,
+                y1: i.y1,
+                z1: i.z1,
+                x2: i.x2,
+                y2: i.y2,
+                z2: i.z2,
+            }
+        })
+        .await
+        {
+            Ok(result) => {
+                tracing::debug!(
+                    "scan_region ({},{},{})-({},{},{}) -> {} block(s){}",
+                    i.x1,
+                    i.y1,
+                    i.z1,
+                    i.x2,
+                    i.y2,
+                    i.z2,
+                    result.blocks.len(),
+                    if result.truncated { " (truncated)" } else { "" }
+                );
+                if let Some(err) = result.error {
+                    err
+                } else if result.blocks.is_empty() {
+                    "Region is all air (or unloaded).".to_owned()
+                } else {
+                    let mut s = format!("{} non-air block(s):\n", result.blocks.len());
+                    for b in &result.blocks {
+                        s.push_str(&format!("({}, {}, {}) {}\n", b.x, b.y, b.z, b.block));
+                    }
+                    if result.truncated {
+                        s.push_str("… (truncated; scan a smaller region for the rest)\n");
+                    }
+                    s
+                }
+            }
+            Err(err) => err,
+        };
+        Ok(ToolOutput::text(text))
+    }
+}
+
 /// Drive one player turn to completion, continuing that session's history.
 async fn handle_turn(
     provider: Arc<dyn LlmProvider>,
     model: String,
     sessions: Sessions,
+    pending: Pending,
+    next_id: Arc<AtomicU64>,
     req: TurnRequest,
 ) {
     let session = req.session;
@@ -327,6 +625,32 @@ async fn handle_turn(
         Arc::new(SayTool { session }) as iacoder_core::BoxedTool,
         Arc::new(PlaceBlockTool { session }) as iacoder_core::BoxedTool,
         Arc::new(FillTool { session }) as iacoder_core::BoxedTool,
+        Arc::new(GetBlockTool {
+            session,
+            pending: Arc::clone(&pending),
+            next_id: Arc::clone(&next_id),
+        }) as iacoder_core::BoxedTool,
+        Arc::new(ScanRegionTool {
+            session,
+            pending: Arc::clone(&pending),
+            next_id: Arc::clone(&next_id),
+        }) as iacoder_core::BoxedTool,
+        // iacoder's built-in web tools, so the agent can research what to build.
+        // `web_search` needs a TAVILY_API_KEY or BRAVE_API_KEY in the environment
+        // (read by `from_env_and_config`); `web_fetch` needs no key. Wrapped in
+        // `Announce` so the player sees a progress beat when they run.
+        Arc::new(Announce {
+            inner: Arc::new(iacoder_tools::WebSearchTool::from_env_and_config(
+                &iacoder_tools::SearchBackendsConfig::default(),
+            )),
+            session,
+            status: "🔍 Searching the web…".to_owned(),
+        }) as iacoder_core::BoxedTool,
+        Arc::new(Announce {
+            inner: Arc::new(iacoder_tools::WebFetchTool::new()),
+            session,
+            status: "📖 Reading a page…".to_owned(),
+        }) as iacoder_core::BoxedTool,
     ];
     let agent = Runtime::new(provider, tools, Arc::new(AllowAll), MAX_TURNS);
 
@@ -391,6 +715,8 @@ async fn handle_turn(
 /// sessions run concurrently; the provider is shared across all of them.
 async fn serve(provider: Arc<dyn LlmProvider>, model: String) -> anyhow::Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU64::new(1));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     while let Some(line) = lines.next_line().await? {
@@ -414,10 +740,14 @@ async fn serve(provider: Arc<dyn LlmProvider>, model: String) -> anyhow::Result<
                 let provider = Arc::clone(&provider);
                 let model = model.clone();
                 let sessions = Arc::clone(&sessions);
+                let pending = Arc::clone(&pending);
+                let next_id = Arc::clone(&next_id);
                 tokio::spawn(handle_turn(
                     provider,
                     model,
                     sessions,
+                    pending,
+                    next_id,
                     TurnRequest {
                         session,
                         prompt,
@@ -430,6 +760,24 @@ async fn serve(provider: Arc<dyn LlmProvider>, model: String) -> anyhow::Result<
                     map.remove(&session);
                 }
                 tracing::debug!("evicted session {session}");
+            }
+            InMsg::QueryResult {
+                request_id,
+                blocks,
+                truncated,
+                error,
+            } => {
+                let sender = pending.lock().ok().and_then(|mut map| map.remove(&request_id));
+                if let Some(tx) = sender {
+                    // Receiver gone (tool timed out already) is fine to ignore.
+                    let _ = tx.send(QueryResult {
+                        blocks,
+                        truncated,
+                        error,
+                    });
+                } else {
+                    tracing::debug!("query result for unknown/expired request {request_id}");
+                }
             }
         }
     }
@@ -456,7 +804,7 @@ async fn serve_offline() -> anyhow::Result<()> {
                     text: format!("(offline) you said: {prompt}"),
                 },
             ),
-            Ok(InMsg::Evict { .. }) => {}
+            Ok(InMsg::Evict { .. } | InMsg::QueryResult { .. }) => {}
             Err(_) => {}
         }
     }

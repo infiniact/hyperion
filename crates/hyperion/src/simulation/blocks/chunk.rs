@@ -82,6 +82,20 @@ impl Column {
         }
     }
 
+    /// Rebuild the cached client packet ([`Self::base_packet_bytes`]) from the
+    /// current (possibly edited) [`Self::data`].
+    ///
+    /// `base_packet_bytes` is otherwise frozen at chunk-load time, so runtime
+    /// `set_block` edits would be lost whenever the chunk is re-sent to a
+    /// client (e.g. a player walks away and back). Call this after edits so
+    /// re-sends carry them. Re-encoding a whole column is not free, so only
+    /// call it for chunks that actually changed.
+    pub fn rebuild_packet(&mut self) {
+        if let Some(bytes) = super::loader::encode_column(&self.data, self.position.as_i16vec2()) {
+            self.base_packet_bytes = bytes;
+        }
+    }
+
     pub fn sections(&self) -> impl Iterator<Item = (IVec3, &Section)> + '_ {
         let column_start_position = IVec3::new(
             self.position.x << 4,

@@ -184,6 +184,19 @@ fn empty_column(position: I16Vec2) -> Column {
     Column::new(bytes.freeze(), unloaded, position)
 }
 
+/// Re-encode the client chunk packet for `data` at `position`. Used after
+/// replaying persisted edits onto a freshly-loaded chunk so players receive the
+/// edited chunk directly. Returns `None` if encoding fails.
+pub fn encode_column(data: &ColumnData, position: I16Vec2) -> Option<bytes::Bytes> {
+    let position = position.as_ivec2();
+    STATE.with_borrow_mut(|state| {
+        encode_chunk_packet(data, position, state)
+            .ok()
+            .flatten()
+            .map(BytesMut::freeze)
+    })
+}
+
 async fn load_chunk(position: I16Vec2, shared: &WorldShared) -> anyhow::Result<Column> {
     let x = position.x;
     let y = position.y;

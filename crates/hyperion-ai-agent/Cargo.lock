@@ -883,6 +883,7 @@ dependencies = [
  "camino",
  "iacoder-agent",
  "iacoder-core",
+ "iacoder-tools",
  "schemars",
  "serde",
  "serde_json",

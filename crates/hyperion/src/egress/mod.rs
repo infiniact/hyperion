@@ -55,6 +55,11 @@ fn broadcast_chunk_deltas(
                 return;
             }
         }
+        // Fold this tick's edits into the cached client packet so they survive
+        // chunk re-sends (a player leaving the area and returning). Without
+        // this, base_packet_bytes stays frozen at load time and edits vanish
+        // on re-send. Only runs for chunks edited this tick.
+        chunk.rebuild_packet();
     });
     blocks.clear_should_update();
 
